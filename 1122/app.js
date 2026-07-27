@@ -17799,7 +17799,10 @@ function applyStyleParams(primaryId, secondaryId){
     return out;
 }
 /* ---- custom programs: any uploaded program becomes a first-class training style ---- */
-function daysOf(st){ const c = st && st.customDays; return (Array.isArray(c) && c.length) ? c : DAYS; }
+function daysOf(st){ const c = st && st.customDays; const base = (Array.isArray(c) && c.length) ? c : DAYS;
+    const ov = (st && st.dayDow) || null;
+    if (!ov) return base;
+    return base.map(function(d){ return ov[d.id] ? { ...d, dow: ov[d.id] } : d; }); }
 /* Coach-built program -> engine day format (reuses normalizeProgram) */
 function coachProgramToDays(prog){
     if(!prog || !Array.isArray(prog.days)) return null;
@@ -19969,6 +19972,34 @@ function EditableTop({ st, ex, pl, updateState }) {
                 fontWeight: 800, fontSize: 15, padding: "5px 8px", textAlign: "center", fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace" } }),
         h("span", { style: { fontSize: 11, color: "#8E8E93" } }, "kg \u00B7 enter"));
 }
+function DayWeekdayPicker({ st, day, updateState }) {
+    const R = React;
+    const [open, setOpen] = R.useState(false);
+    const DOWS = ["MON","TUE","WED","THU","FRI","SAT","SUN"];
+    const cur = day.dow;
+    const setDow = function(v){
+        const map = { ...(st.dayDow || {}) };
+        // if another day already sits on v, swap their weekdays so none collide
+        const taken = daysOf(st).find(function(d){ return d.id !== day.id && d.dow === v; });
+        if (taken) map[taken.id] = cur;
+        map[day.id] = v;
+        updateState({ dayDow: map });
+        setOpen(false);
+    };
+    return h("div", { style: { marginTop: 8 } },
+        h("button", { onClick: function(){ setOpen(!open); },
+            style: { display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 11px", borderRadius: 9,
+                border: `1px solid ${BORDER}`, background: "transparent", color: "#98989F", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "ui-monospace, monospace" } },
+            "TRAIN THIS ON: ", h("span", { style: { color: ACC } }, cur), " \u25BE"),
+        open ? h("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 } },
+            DOWS.map(function(dw){ const on = dw === cur;
+                return h("button", { key: dw, onClick: function(){ setDow(dw); },
+                    style: { padding: "8px 12px", borderRadius: 9, border: `1px solid ${on ? ACC : BORDER}`,
+                        background: on ? ACC + "18" : "transparent", color: on ? ACC : "#98989F",
+                        fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: "ui-monospace, monospace" } }, dw); })) : null,
+        open ? h("div", { style: { fontSize: 10.5, color: "#6E6E73", marginTop: 6, lineHeight: 1.4 } },
+            "Moves this session's weekday only \u2014 the exercises, sets and weights stay exactly the same.") : null);
+}
 function Session({ st, day, setActiveDay, targeted, readiness, setReadiness, readinessScore, decision, logs, setLogSet, addSet, removeSet, triggerRest, restSignal, planned, setE1, completeSession, openHelp, nextId, updateState }) {
     const [genomeEx, setGenomeEx] = useState(null);
     const inR = st.phase === "restart";
@@ -19989,7 +20020,8 @@ function Session({ st, day, setActiveDay, targeted, readiness, setReadiness, rea
                 day.dow, " \u00B7 ",
                 inR ? `RESTART WEEK ${st.restartWeek}` : `WEEK ${st.week} · ${WAVE[st.week].phase}`),
             h("div", { style: { fontWeight: 800, fontSize: 22, marginTop: 4 } }, day.plain),
-            h("div", { style: { fontSize: 12, color: "#98989F", marginTop: 4 } }, day.focus)),
+            h("div", { style: { fontSize: 12, color: "#98989F", marginTop: 4 } }, day.focus),
+            h(DayWeekdayPicker, { st: st, day: day, updateState: updateState })),
         (function(){ const wc = waveContext(st); if (!wc) return null;
             const col = wc.dir === "up" ? POS : wc.dir === "down" ? "#ffb74d" : "#98989F";
             const bg = wc.dir === "up" ? "rgba(52,211,154,0.06)" : wc.dir === "down" ? "rgba(255,183,77,0.06)" : "rgba(255,255,255,0.03)";
@@ -22073,6 +22105,7 @@ function useCloud(applyState) {
     const [profile, setProfile] = useState(null);
     const [status, setStatus] = useState(sbReady() ? "loading" : "disabled"); // disabled|signedout|syncing|synced|error|loading
     const [linkedActive, setLinkedActive] = useState(false);
+    const [recovery, setRecovery] = useState(false);
     const tickRef = useRef(null);
     const userRef = useRef(null);
 
@@ -22118,7 +22151,8 @@ function useCloud(applyState) {
             const ch = c.auth.onAuthStateChange(function (_e, session) {
                 const u = session ? session.user : null;
                 setUser(u);
-                if (u) { ensureProfileRow(u).then(function(){ loadProfile(u); }); doSync(u); } else { setProfile(null); setStatus("signedout"); }
+                if (_e === "PASSWORD_RECOVERY") setRecovery(true); // arrived via a reset link -> prompt new password
+                if (u) { ensureProfileRow(u).then(function(){ loadProfile(u); }); doSync(u); } else { setProfile(null); setStatus("signedout"); setRecovery(false); }
             });
             sub = ch && ch.data ? ch.data.subscription : null;
         } catch (e) {}
@@ -22173,10 +22207,24 @@ function useCloud(applyState) {
         if (!r || r.data !== true) throw new Error("Invalid or expired code \u2014 ask your coach for a fresh one (they last 5 minutes).");
         return true;
     }, []);
+    const updatePassword = useCallback(async function (newPw) {
+        const c = sb(); if (!c) throw new Error("Cloud not configured");
+        if (!newPw || String(newPw).length < 6) throw new Error("Password needs at least 6 characters.");
+        const r = await c.auth.updateUser({ password: String(newPw) });
+        if (r && r.error) throw r.error;
+        return true;
+    }, []);
+    const resetPw = useCallback(async function (email) {
+        const c = sb(); if (!c) throw new Error("Cloud not configured");
+        const r = await c.auth.resetPasswordForEmail(String(email).trim().toLowerCase(),
+            { redirectTo: (typeof location !== "undefined" ? location.origin : undefined) });
+        if (r && r.error) throw r.error;
+        return true;
+    }, []);
     const signOut = useCallback(async function () { const c = sb(); if (c) await c.auth.signOut(); setUser(null); setProfile(null); setStatus("signedout"); }, []);
     const pushNow = useCallback(function () { if (user) cloudPush(user).catch(function () {}); }, [user]);
 
-    return { user: user, profile: profile, status: status, linkedActive: linkedActive, signUp: signUp, signInPw: signInPw, linkByCode: function (code) { return linkByCode(code).then(function (r) { checkLink(userRef.current); loadProfile(userRef.current); return r; }); }, signOut: signOut, sync: function () { return doSync(user); }, pushNow: pushNow, reloadProfile: function () { return loadProfile(user); } };
+    return { user: user, profile: profile, status: status, linkedActive: linkedActive, recovery: recovery, clearRecovery: function(){ setRecovery(false); }, updatePassword: updatePassword, resetPw: resetPw, signUp: signUp, signInPw: signInPw, linkByCode: function (code) { return linkByCode(code).then(function (r) { checkLink(userRef.current); loadProfile(userRef.current); return r; }); }, signOut: signOut, sync: function () { return doSync(user); }, pushNow: pushNow, reloadProfile: function () { return loadProfile(user); } };
 }
 
 /* Guarantees a public.profiles row exists for the signed-in user (registration-status fix):
@@ -22191,6 +22239,29 @@ async function ensureProfileRow(u){
 }
 
 /* ---- ACCOUNT PANEL (rendered in the Engine tab) ---- */
+function ChangePw({ cloud, showToast, forced }) {
+    const R = React;
+    const [open, setOpen] = R.useState(!!forced);
+    const [pw, setPw] = R.useState("");
+    const [busy, setBusy] = R.useState(false);
+    R.useEffect(function () { if (forced) setOpen(true); }, [forced]);
+    const save = async function () {
+        setBusy(true);
+        try { await cloud.updatePassword(pw); setPw(""); setOpen(false); cloud.clearRecovery();
+            showToast("Password updated \u2014 use it next time you sign in."); }
+        catch (e) { showToast(String((e && e.message) || e)); }
+        setBusy(false);
+    };
+    return h("div", { style: { marginTop: 12 } },
+        forced ? h("div", { style: { padding: "10px 12px", borderRadius: 10, background: ACC + "14", border: `1px solid ${ACC}44`, fontSize: 12, color: "#EBEBF0", lineHeight: 1.5, marginBottom: 9 } },
+            "You arrived from a reset link \u2014 set your new password now.") : null,
+        !open ? h("button", { onClick: function () { setOpen(true); }, style: { background: "none", border: "none", color: ACC, fontSize: 11.5, cursor: "pointer", textDecoration: "underline", padding: 0 } }, "Change password")
+        : h("div", { style: { display: "flex", gap: 8 } },
+            h("input", { type: "password", autoComplete: "new-password", value: pw, placeholder: "new password (6+)",
+                onChange: function (e) { setPw(e.target.value); },
+                style: { ...S.fieldInput, textAlign: "left", flex: 1 } }),
+            h("button", { onClick: save, disabled: busy, style: { ...S.cta, width: "auto", padding: "0 16px", opacity: busy ? 0.6 : 1 } }, busy ? "\u2026" : "SAVE")));
+}
 function AccountPanel({ cloud, showToast }) {
     const [mode, setMode] = useState("signup"); // signup | signin
     const [email, setEmail] = useState("");
@@ -22212,7 +22283,8 @@ function AccountPanel({ cloud, showToast }) {
                     h("div", { style: { fontSize: 11.5, color: "#98989F", marginTop: 3 } }, "Linked to your coach as ", h("b", null, cloud.user.email), ". Your training syncs to their dashboard automatically."))),
             h("div", { style: { display: "flex", gap: 8 } },
                 h("button", { onClick: cloud.sync, style: { ...S.btn, flex: 1 } }, "Sync now"),
-                h("button", { onClick: cloud.signOut, style: { ...S.btn, flex: 1, color: "#ff8aa0" } }, "Sign out"))));
+                h("button", { onClick: cloud.signOut, style: { ...S.btn, flex: 1, color: "#ff8aa0" } }, "Sign out")),
+            h(ChangePw, { cloud: cloud, showToast: showToast, forced: cloud.recovery })));
 
     // ===== STATE 2: signed in, NOT yet linked -> show the code box =====
     if (cloud.user)
@@ -22226,6 +22298,7 @@ function AccountPanel({ cloud, showToast }) {
                 h("input", { value: code, onChange: function (e) { setCode(e.target.value.replace(/\D/g, "").slice(0, 6)); }, placeholder: "6-digit code", maxLength: 6, inputMode: "numeric", autoComplete: "one-time-code",
                     style: { ...S.fieldInput, textAlign: "center", flex: 1, letterSpacing: 6, fontSize: 22, fontWeight: 800, fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace" } }),
                 h("button", { onClick: async function () { setBusy(true); try { await cloud.linkByCode(code); showToast("Linked to your coach \u2014 welcome aboard."); setCode(""); } catch (e) { showToast(String((e && e.message) || e)); } setBusy(false); }, disabled: busy, style: { ...S.cta, width: "auto", padding: "0 22px", opacity: busy ? 0.6 : 1 } }, busy ? "\u2026" : "LINK")),
+            h(ChangePw, { cloud: cloud, showToast: showToast, forced: cloud.recovery }),
             h("button", { onClick: cloud.signOut, style: { background: "none", border: "none", color: "#6E6E73", fontSize: 11, cursor: "pointer", textDecoration: "underline", marginTop: 12 } }, "Sign out")));
 
     // ===== STATE 1: no account yet -> create one (email + password) =====
@@ -22251,7 +22324,12 @@ function AccountPanel({ cloud, showToast }) {
         h("input", { type: "password", autoComplete: mode === "signup" ? "new-password" : "current-password", value: pw, placeholder: "password (6+ characters)", onChange: function (e) { setPw(e.target.value); }, style: { ...S.fieldInput, textAlign: "left", width: "100%", boxSizing: "border-box", marginBottom: 12 } }),
         h("button", { onClick: submit, disabled: busy, style: { ...S.cta, opacity: busy ? 0.6 : 1 } }, busy ? "\u2026" : (mode === "signup" ? "CREATE ACCOUNT" : "SIGN IN")),
         h("button", { onClick: function () { setMode(mode === "signup" ? "signin" : "signup"); }, style: { background: "none", border: "none", color: ACC, fontSize: 11.5, cursor: "pointer", marginTop: 12, width: "100%" } },
-            mode === "signup" ? "Already have an account? Sign in" : "New here? Create an account")));
+            mode === "signup" ? "Already have an account? Sign in" : "New here? Create an account"),
+        mode === "signin" ? h("button", { onClick: async function () {
+                if (!email || email.indexOf("@") < 0) { showToast("Type your email above first."); return; }
+                try { await cloud.resetPw(email.trim()); showToast("Reset link sent \u2014 it opens the app signed in, then you set a new password right here."); }
+                catch (e) { showToast(String((e && e.message) || e)); }
+            }, style: { background: "none", border: "none", color: "#6E6E73", fontSize: 11, cursor: "pointer", textDecoration: "underline", marginTop: 8, width: "100%" } }, "Forgot password?") : null));
 }
 
 /* ---- ATHLETE: REQUEST COACHING (privacy-first: athlete only ever sees "Coach") ---- */
