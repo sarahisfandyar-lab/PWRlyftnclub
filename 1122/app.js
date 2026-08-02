@@ -20297,7 +20297,6 @@ function Engine({ st, updateState, tmOf, advance, resetAll, exportData, importDa
         h(BiodataCard, { st: st, updateState: updateState, showToast: showToast }),
         h(SectionLabel, { icon: Activity, text: "ACCOUNT & SYNC", sub: "back up your training and sync across devices" }),
         cloud ? h(AccountPanel, { cloud: cloud, showToast: showToast }) : null,
-        cloud ? h(AthleteCoaching, { cloud: cloud, showToast: showToast }) : null,
         h(SectionLabel, { icon: Cpu, text: "THE ENGINE", sub: "every value here re-coordinates your loads instantly" }),
         h("div", { style: S.engineCard, className: "rise" },
             h("div", { style: S.cardTitle }, inR ? "RESTART PROGRESS" : "PROGRAM WEEK"),
@@ -22299,13 +22298,31 @@ function useCloud(applyState) {
     }, []);
     const linkByCode = useCallback(async function (rawCode) {
         const c = sb(); if (!c) throw new Error("Cloud not configured");
+        // Step 1 — read the entered value
         const v = String(rawCode).replace(/\D/g, "");
         if (v.length !== 6) throw new Error("Enter the 6-digit code your coach gave you.");
         const s = await c.auth.getSession();
-        if (!(s && s.data && s.data.session)) throw new Error("Make your account first, then enter the code.");
-        const r = await c.rpc("redeem_coach_code", { p_code: v });
-        if (r && r.error) throw r.error;
-        if (!r || r.data !== true) throw new Error("Invalid or expired code \u2014 ask your coach for a fresh one (they last 5 minutes).");
+        const sess = s && s.data && s.data.session;
+        if (!sess) throw new Error("Make your account first, then enter the code.");
+        const me = sess.user.id;
+        // Step 2 — find the coach by permanent code on their profile
+        const look = await c.from("profiles").select("id,coach_code").eq("is_coach", true).eq("coach_code", v).maybeSingle();
+        if (look && look.error) throw look.error;
+        // Step 3 — no match -> reject, do NOT create a request
+        if (!look || !look.data) throw new Error("Invalid coaching code.");
+        const coach = look.data;
+        // Step 4 — insert the request with code populated (never null)
+        const ins = await c.from("coach_requests").insert({
+            athlete_id: me,
+            coach_id: coach.id,
+            code: coach.coach_code,
+            status: "pending"
+        });
+        if (ins && ins.error) {
+            // if a request already exists, treat as success rather than erroring the athlete
+            const msg = String(ins.error.message || "").toLowerCase();
+            if (msg.indexOf("duplicate") < 0 && msg.indexOf("unique") < 0) throw ins.error;
+        }
         return true;
     }, []);
     const updatePassword = useCallback(async function (newPw) {
@@ -22434,85 +22451,6 @@ function AccountPanel({ cloud, showToast }) {
 }
 
 /* ---- ATHLETE: REQUEST COACHING (privacy-first: athlete only ever sees "Coach") ---- */
-function AthleteCoaching({ cloud, showToast }) {
-    const [cstat, setCstat] = useState("loading"); // none|pending|code_ready|approved|declined|unavailable
-    const [busy, setBusy] = useState(false);
-    const [code, setCode] = useState("");
-    const check = useCallback(async function () {
-        const c = sb(); if (!c || !cloud.user) { setCstat("loading"); return; }
-        try { const r = await c.rpc("my_coaching_status");
-            if (r && r.error) throw r.error;
-            setCstat(r && r.data ? r.data : "none");
-        } catch (e) { setCstat("unavailable"); }
-    }, [cloud.user]);
-    useEffect(function () { check(); }, [check]);
-    useEffect(function () {
-        const onVis = function(){ if (!document.hidden) check(); };
-        document.addEventListener("visibilitychange", onVis);
-        const t = setInterval(function(){ if (!document.hidden && (cstat === "pending" || cstat === "code_ready" || cstat === "loading")) check(); }, 20000);
-        return function(){ document.removeEventListener("visibilitychange", onVis); clearInterval(t); };
-    }, [check, cstat]);
-    const request = async function () {
-        const c = sb(); if (!c) return;
-        setBusy(true);
-        try {
-            const p = _payload();
-            const prof = (p && p.profile) || {};
-            const strength = (p && p.bestEver) || null;
-            const r = await c.rpc("request_coaching", {
-                p_name: prof.name || (cloud.profile && cloud.profile.display_name) || "Athlete",
-                p_goal: prof.goal || "", p_experience: prof.experience || "", p_strength: strength });
-            if (r && r.error) throw r.error;
-            setCstat(r && r.data ? r.data : "pending");
-            showToast(r && r.data === "approved" ? "You're already linked with your coach." : "Your coaching request has been submitted.");
-        } catch (e) { showToast("Couldn't send the request: " + ((e && e.message) || e)); }
-        setBusy(false);
-    };
-    const redeem = async function () {
-        const c = sb(); if (!c) return;
-        const v = code.trim().toUpperCase();
-        if (v.length < 4) { showToast("Enter the code your coach sent you."); return; }
-        setBusy(true);
-        try { const r = await c.rpc("redeem_coach_code", { p_code: v });
-            if (r && r.error) throw r.error;
-            if (r && r.data === true) { setCstat("approved"); setCode(""); showToast("Linked to your coach \u2014 welcome aboard."); }
-            else { showToast("Invalid Coach Code"); }
-        } catch (e) { showToast("Invalid Coach Code"); }
-        setBusy(false);
-    };
-    if (!cloud.user || (cloud.profile && cloud.profile.is_coach) || cstat === "unavailable" || cstat === "loading") return null;
-    if (cstat === "approved" || cstat === "active")
-        return h("div", { style: { ...S.engineCard, borderColor: POS + "55", marginTop: 12 }, className: "rise" },
-            h("div", { style: { display: "flex", alignItems: "center", gap: 9 } },
-                h(Check, { size: 16, color: POS }),
-                h("div", null,
-                    h("div", { style: { fontWeight: 800, fontSize: 13.5, color: POS } }, "Coaching active."),
-                    h("div", { style: { fontSize: 11.5, color: "#98989F", marginTop: 2 } }, "Your training syncs to your coach automatically. Just lift."))));
-    if (cstat === "code_ready")
-        return h("div", { style: { ...S.engineCard, borderColor: ACC + "55", marginTop: 12 }, className: "rise" },
-            h("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 4 } }, "Enter Coach Code"),
-            h("div", { style: { fontSize: 11.5, color: "#98989F", lineHeight: 1.55, marginBottom: 11 } }, "Your coach approved you and sent a code. Enter it to activate coaching."),
-            h("div", { style: { display: "flex", gap: 8 } },
-                h("input", { value: code, onChange: function(e){ setCode(e.target.value.toUpperCase()); }, placeholder: "PWR-XXXX", maxLength: 12,
-                    style: { ...S.fieldInput, textAlign: "center", flex: 1, fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", letterSpacing: 3, fontWeight: 800 } }),
-                h("button", { onClick: redeem, disabled: busy, style: { ...S.cta, width: "auto", padding: "0 20px", opacity: busy ? 0.6 : 1 } }, busy ? "\u2026" : "VERIFY")));
-    if (cstat === "pending")
-        return h("div", { style: { ...S.engineCard, marginTop: 12 }, className: "rise" },
-            h("div", { style: { display: "flex", alignItems: "center", gap: 9 } },
-                h("span", { className: "pulse", style: { width: 8, height: 8, borderRadius: "50%", background: "#ffb74d", flexShrink: 0 } }),
-                h("div", null,
-                    h("div", { style: { fontWeight: 800, fontSize: 13.5 } }, "Pending Approval"),
-                    h("div", { style: { fontSize: 11.5, color: "#98989F", marginTop: 2 } }, "Your coaching request has been submitted. Once your coach sends your code, a box will appear here to enter it."))));
-    return h("div", { style: { ...S.engineCard, marginTop: 12 }, className: "rise" },
-        h("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 4 } }, "Train under a coach"),
-        h("div", { style: { fontSize: 11.5, color: "#98989F", lineHeight: 1.55, marginBottom: 10 } }, "One tap sends your profile, goals and strength numbers to your coach for review" + (cstat === "declined" ? ". You can request again any time." : ".")),
-        h("button", { onClick: request, disabled: busy, style: { ...S.cta, padding: "13px" } }, busy ? "\u2026" : "REQUEST COACHING"));
-}
-
-/* ---- COACH DASHBOARD ---- */
-/* Error boundary so the coach screen can never render as a black void —
-   if anything throws, show the error + a working code generator. */
-/* ---- BIODATA: comprehensive athlete profile, fully skippable, syncs to coach ---- */
 function BiodataCard({ st, updateState, showToast }) {
     const R = React;
     const [open, setOpen] = R.useState(false);
@@ -22565,25 +22503,21 @@ function MasterControl({ cloud, showToast }) {
     const [err, setErr] = R.useState(null);
     const load = R.useCallback(async function () {
         const c = sb(); if (!c || !cloud.user) return;
+        setErr(null);
         try {
-            const out = {};
-            const prof = await c.from("profiles").select("id,is_coach", { count: "exact" });
-            out.users = (prof && prof.data) ? prof.data.length : 0;
-            out.coaches = (prof && prof.data) ? prof.data.filter(function(p){ return p.is_coach; }).length : 0;
-            const links = await c.from("coach_links").select("id,status");
-            out.links = (links && links.data) ? links.data.filter(function(l){ return l.status === "active"; }).length : 0;
-            const codes = await c.from("coach_codes").select("code,claimed_by,expires_at,created_at");
-            const cd = (codes && codes.data) || [];
-            out.codesTotal = cd.length;
-            out.codesClaimed = cd.filter(function(x){ return x.claimed_by; }).length;
-            out.codesLive = cd.filter(function(x){ return !x.claimed_by && x.expires_at && new Date(x.expires_at) > new Date(); }).length;
-            const sess = await c.from("sessions").select("id,athlete_id,performed_at").order("performed_at", { ascending: false }).limit(500);
-            const sd = (sess && sess.data) || [];
-            out.sessions = sd.length;
-            out.activeAthletes = new Set(sd.map(function(x){ return x.athlete_id; })).size;
-            const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0,10);
-            out.sessions7d = sd.filter(function(x){ return String(x.performed_at) >= since; }).length;
-            setStats(out);
+            // Single admin RPC returns real platform-wide counts (bypasses per-row RLS safely, admin-only).
+            const r = await c.rpc("admin_metrics");
+            if (r && r.error) throw r.error;
+            const m = (r && r.data) || {};
+            setStats({
+                users: m.users || 0,
+                coaches: m.coaches || 0,
+                links: m.active_links || 0,
+                activeAthletes: m.active_athletes || 0,
+                sessions: m.sessions_total || 0,
+                sessions7d: m.sessions_7d || 0,
+                requests: m.pending_requests || 0
+            });
         } catch (e) { setErr(String((e && e.message) || e)); }
     }, [cloud.user]);
     R.useEffect(function () { load(); }, [load]);
@@ -22616,11 +22550,9 @@ function MasterControl({ cloud, showToast }) {
                 stat("SESSIONS (7D)", stats.sessions7d, "last 7 days", POS),
                 stat("SESSIONS TOTAL", stats.sessions, "recent 500 sampled"),
                 stat("AVG / ATHLETE", stats.activeAthletes ? Math.round(stats.sessions / stats.activeAthletes) : 0, "sessions each")),
-            h(SectionLabel, { icon: PawIcon, text: "INVITE CODES", sub: "onboarding funnel" }),
+            h(SectionLabel, { icon: PawIcon, text: "COACHING", sub: "requests waiting for you" }),
             h("div", { style: { display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 16 } },
-                stat("CLAIMED", stats.codesClaimed, "became clients", POS),
-                stat("LIVE NOW", stats.codesLive, "unclaimed, valid", ACC),
-                stat("GENERATED", stats.codesTotal, "all time")),
+                stat("PENDING REQUESTS", stats.requests, "athletes who entered your code", ACC)),
             h("div", { style: { ...S.engineCard, marginTop: 4 } },
                 h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 1.2, color: "#8E8E93", marginBottom: 8 } }, "BUILD"),
                 h("div", { style: { fontSize: 12.5, color: "#C7C7CC", lineHeight: 1.6 } },
@@ -22723,23 +22655,38 @@ function CoachView({ cloud, showToast }) {
         const c = sb(); if (!c) return;
         try { const r = await c.rpc("archive_request", { p_request: id }); if (r && r.error) throw r.error; load(); } catch (e) {}
     };
+    const approve = async function (r) {
+        const c = sb(); if (!c) return;
+        try {
+            const ins = await c.from("coach_links").insert({
+                coach_id: cloud.user.id, athlete_id: r.athlete_id, status: "active",
+                invited_at: new Date().toISOString(), responded_at: new Date().toISOString()
+            });
+            if (ins && ins.error) {
+                const m = String(ins.error.message || "").toLowerCase();
+                if (m.indexOf("duplicate") < 0 && m.indexOf("unique") < 0) throw ins.error;
+            }
+            await c.from("coach_requests").update({ status: "approved", responded_at: new Date().toISOString() }).eq("id", r.id);
+            showToast("Approved \u2014 " + (r.athlete_name || "athlete") + " is now on your roster.");
+            load();
+        } catch (e) { showToast("Couldn't approve: " + ((e && e.message) || e)); }
+    };
+    const declineReq = async function (id) {
+        const c = sb(); if (!c) return;
+        try { await c.from("coach_requests").update({ status: "declined", responded_at: new Date().toISOString() }).eq("id", id);
+            showToast("Request declined."); load(); } catch (e) {}
+    };
+    const PERMANENT_CODE = (cloud.profile && cloud.profile.coach_code) || "448730";
     return (h("div", { style: { paddingBottom: 28 } },
         (!cloud.user || !sb()) ? h("div", { style: { background: "#2a1518", border: "1px solid #ff4d6d55", color: "#ffb3c0", padding: "10px 14px", borderRadius: 10, margin: "12px 0", fontFamily: "monospace", fontSize: 11.5, lineHeight: 1.6 } },
             !sb() ? "Cloud connection failed to initialize \u2014 close the app fully and reopen." :
             "You're not signed in \u2014 go to Engine \u2192 Account and sign in, then come back.") : null,
         h("div", { style: { ...S.engineCard, marginTop: 8, marginBottom: 12, borderColor: ACC + "44" }, className: "rise" },
-            h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 1.5, color: ACC, marginBottom: 10, fontWeight: 700 } }, "ADD A CLIENT"),
-            newCode
-                ? h("div", null,
-                    h("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "16px", borderRadius: 12, border: `1px solid ${ACC}55`, background: `${ACC}12`, marginBottom: 10 } },
-                        h("span", { style: { ...S.mono, fontSize: 26, fontWeight: 800, letterSpacing: 4, color: ACC } }, newCode)),
-                    h("div", { style: { fontSize: 12, color: "#98989F", lineHeight: 1.5, marginBottom: 10, textAlign: "center" } }, "Valid for 5 minutes \u2014 send it now. They make an account (Engine \u2192 Account) and type it in. Expired? Just generate a new one."),
-                    h("div", { style: { display: "flex", gap: 8 } },
-                        h("button", { onClick: function () { try { navigator.clipboard.writeText(newCode); showToast("Copied " + newCode); } catch (e) {} }, style: { ...S.btn, flex: 1 } }, "Copy again"),
-                        h("button", { onClick: makeInviteCode, style: { ...S.btn, flex: 1, color: ACC } }, "New code")))
-                : h("div", null,
-                    h("div", { style: { fontSize: 12, color: "#C7C7CC", lineHeight: 1.5, marginBottom: 10 } }, "Generates a one-time 6-digit code, valid 5 minutes. Send it to your client; they make an account and type it in. You control exactly who joins."),
-                    h("button", { onClick: makeInviteCode, style: { ...S.cta } }, "GENERATE INVITE CODE"))),
+            h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 1.5, color: ACC, marginBottom: 10, fontWeight: 700 } }, "YOUR COACHING CODE"),
+            h("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "18px", borderRadius: 12, border: `1px solid ${ACC}55`, background: `${ACC}12`, marginBottom: 10 } },
+                h("span", { style: { ...S.mono, fontSize: 30, fontWeight: 800, letterSpacing: 6, color: ACC } }, PERMANENT_CODE)),
+            h("div", { style: { fontSize: 12, color: "#98989F", lineHeight: 1.5, marginBottom: 10, textAlign: "center" } }, "Share this code with your athletes. They make an account, enter it, and appear below for you to approve."),
+            h("button", { onClick: function () { try { navigator.clipboard.writeText(PERMANENT_CODE); showToast("Copied " + PERMANENT_CODE); } catch (e) {} }, style: { ...S.cta } }, "COPY CODE")),
         requests.length ? h(React.Fragment, null,
             h(SectionLabel, { icon: Flame, text: "PENDING ATHLETE REQUESTS", sub: requests.length + " waiting for your decision" }),
             requests.map(function (r) {
@@ -22751,18 +22698,11 @@ function CoachView({ cloud, showToast }) {
                             h("div", { style: { fontWeight: 800, fontSize: 15 } }, r.athlete_name || "Athlete"),
                             h("div", { style: { fontSize: 11.5, color: "#98989F", marginTop: 2, wordBreak: "break-all" } }, r.athlete_email || ""),
                             h("div", { style: { ...S.mono, fontSize: 10, color: "#8E8E93", marginTop: 6 } },
-                                (r.experience ? r.experience + " \u00B7 " : "") + (r.goal ? r.goal + " \u00B7 " : "") + (sbd ? "S/B/D " + sbd + " kg \u00B7 " : "") + new Date(r.created_at).toLocaleDateString())),
+                                (r.experience ? r.experience + " \u00B7 " : "") + (r.goal ? r.goal + " \u00B7 " : "") + (sbd ? "S/B/D " + sbd + " kg \u00B7 " : "") + (r.created_at ? new Date(r.created_at).toLocaleDateString() : ""))),
                         h("span", { style: { ...S.mono, fontSize: 10, fontWeight: 800, letterSpacing: 1, color: ACC, background: ACC + "14", border: "1px solid " + ACC + "44", borderRadius: 7, padding: "4px 8px", flexShrink: 0 } }, r.code)),
-                    r.code
-                        ? h("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 11 } },
-                            h("div", { style: { flex: 1, padding: "11px", borderRadius: 11, border: "1px solid " + POS + "55", background: POS + "12", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 } },
-                                h("span", { style: { ...S.mono, fontSize: 15, fontWeight: 800, letterSpacing: 2, color: POS } }, r.code),
-                                h("span", { style: { ...S.mono, fontSize: 9, color: "#8E8E93" } }, "SENT? AWAITING ENTRY")),
-                            h("button", { onClick: function(){ try { navigator.clipboard.writeText(r.code); showToast("Copied " + r.code); } catch(e){} }, style: { padding: "11px 14px", borderRadius: 11, border: "1px solid " + BORDER, background: "transparent", color: "#EBEBF0", fontWeight: 700, fontSize: 12, cursor: "pointer" } }, "COPY"),
-                            h("button", { onClick: function(){ archive(r.id); }, style: { padding: "11px 12px", borderRadius: 11, border: "1px solid " + BORDER, background: "transparent", color: "#6E6E73", fontWeight: 700, fontSize: 12, cursor: "pointer" } }, "ARCHIVE"))
-                        : h("div", { style: { display: "flex", gap: 7, marginTop: 11 } },
-                            h("button", { onClick: function(){ genCode(r.id); }, style: { flex: 1.6, padding: "11px", borderRadius: 11, border: "none", background: ACC, color: "#1A1104", fontWeight: 800, fontSize: 12.5, cursor: "pointer" } }, "GENERATE COACH CODE"),
-                            h("button", { onClick: function(){ decline(r.id); }, style: { flex: 1, padding: "11px", borderRadius: 11, border: "1px solid #ff4d6d55", background: "transparent", color: "#ff8aa0", fontWeight: 700, fontSize: 12.5, cursor: "pointer" } }, "DECLINE")));
+                    h("div", { style: { display: "flex", gap: 7, marginTop: 11 } },
+                        h("button", { onClick: function(){ approve(r); }, style: { flex: 1.6, padding: "11px", borderRadius: 11, border: "none", background: POS, color: "#06140c", fontWeight: 800, fontSize: 12.5, cursor: "pointer" } }, "APPROVE"),
+                        h("button", { onClick: function(){ declineReq(r.id); }, style: { flex: 1, padding: "11px", borderRadius: 11, border: "1px solid #ff4d6d55", background: "transparent", color: "#ff8aa0", fontWeight: 700, fontSize: 12.5, cursor: "pointer" } }, "DECLINE")));
             })) : null,
         h(SectionLabel, { icon: PawIcon, text: "ROSTER", sub: clients ? clients.length + " linked" : "loading\u2026" }),
         (!clients || clients.length === 0)
