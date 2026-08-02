@@ -19514,9 +19514,11 @@ function Onboarding({ base, finish }) {
     const [styleSel, setStyleSel] = useState({ primary: "house", secondary: null });
     const [mixOn, setMixOn] = useState(false);
     const [progTxt, setProgTxt] = useState("");
+    const [bio, setBio] = useState(base.biodata || {});
+    const [skipped, setSkipped] = useState({});
     const [est, setEst] = useState({ squat: { kg: 160, reps: 3 }, bench: { kg: 100, reps: 3 }, deadlift: { kg: 200, reps: 3 } });
     const setProf = (k, v) => setP(s => ({ ...s, [k]: v }));
-    const steps = ["Welcome", "About you", "Profile", "Your maxes", "Time off", "Weak points", "Schedule", "Training style"];
+    const steps = ["Welcome", "About you", "Profile", "Your maxes", "Time off", "Weak points", "Schedule", "Body & health", "Your programs", "Training style"];
     const N = steps.length;
     const effectiveOrm = estMode
         ? { squat: e1rm(est.squat.kg, est.squat.reps, 9), bench: e1rm(est.bench.kg, est.bench.reps, 9), deadlift: e1rm(est.deadlift.kg, est.deadlift.reps, 9) }
@@ -19536,7 +19538,9 @@ function Onboarding({ base, finish }) {
             return LIFTS.every(l => !!wp[l]);
         if (step === 6)
             return !!p.daysPerWeek;
-        if (step === 7)
+        if (step === 7) return true; // biodata — skippable
+        if (step === 8) return true; // program upload — skippable
+        if (step === 9)
             return !!styleSel.primary && (!mixOn || (styleSel.secondary && styleSel.secondary !== styleSel.primary));
         return true;
     })();
@@ -19546,7 +19550,7 @@ function Onboarding({ base, finish }) {
         if (step < N - 1)
             setStep(step + 1);
         else
-            finish({ profile: p, oneRM: effectiveOrm, weakpoints: wp, styleSel: styleSel, pendingImport: progTxt.trim() || null });
+            finish({ profile: p, oneRM: effectiveOrm, weakpoints: wp, styleSel: styleSel, pendingImport: progTxt.trim() || null, biodata: (skipped.bio ? { skipped: true } : bio) });
     };
     return (h("div", { style: { ...S.main, position: "relative", zIndex: 2, paddingTop: 24, maxWidth: 560 }, className: "view" },
         h("div", { style: { textAlign: "center", marginBottom: 16 } },
@@ -19623,6 +19627,27 @@ function Onboarding({ base, finish }) {
                             p.weeksOff >= 2 ? "Your Restart starts at Week 1." : "Your main program is set.",
                             " Your maxes, weak points, and recovery profile are all wired into the engine."))),
                 step === 7 && h(React.Fragment, null,
+                    h(Title, { icon: User, t: "Body & health" }),
+                    h("p", { style: S.lead }, "Optional but powerful \u2014 your structure and any injuries let the engine and your coach program around you. Skip any of it."),
+                    h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 4 } },
+                        h("div", null, h(Label, { t: "Height" }), h(NumIn, { value: bio.heightCm || "", onChange: v => setBio(b => ({ ...b, heightCm: v === "" ? "" : parseFloat(v) })), suffix: "cm", w: "100%" })),
+                        h("div", null, h(Label, { t: "Wingspan" }), h(NumIn, { value: bio.wingspanCm || "", onChange: v => setBio(b => ({ ...b, wingspanCm: v === "" ? "" : parseFloat(v) })), suffix: "cm", w: "100%" }))),
+                    h(Label, { t: "Femur length", mt: true }),
+                    h(Seg, { options: [{ v: "Short", l: "Short" }, { v: "Average", l: "Average" }, { v: "Long", l: "Long" }], value: bio.femur, onChange: v => setBio(b => ({ ...b, femur: v })) }),
+                    h(Label, { t: "Injuries / conditions", mt: true }),
+                    h("textarea", { value: bio.injuries || "", onChange: e => setBio(b => ({ ...b, injuries: e.target.value })), rows: 2, placeholder: "Past injuries, pain, medical conditions \u2014 anything that affects training", style: { ...S.bigInput, resize: "vertical", fontFamily: "inherit", fontSize: 14, lineHeight: 1.5 } }),
+                    h(Label, { t: "Movement restrictions", mt: true }),
+                    h("textarea", { value: bio.restrictions || "", onChange: e => setBio(b => ({ ...b, restrictions: e.target.value })), rows: 2, placeholder: "e.g. no overhead pressing, limited squat depth", style: { ...S.bigInput, resize: "vertical", fontFamily: "inherit", fontSize: 14, lineHeight: 1.5 } }),
+                    h("button", { onClick: function () { setSkipped(s => ({ ...s, bio: true })); setBio({ skipped: true }); setStep(step + 1); }, style: { marginTop: 14, width: "100%", padding: "11px", borderRadius: 12, border: `1px solid ${BORDER}`, background: "transparent", color: "#8E8E93", fontWeight: 700, fontSize: 13, cursor: "pointer" } }, "Skip this \u2014 add it later")),
+                step === 8 && h(React.Fragment, null,
+                    h(Title, { icon: Cpu, t: "Bring your programs" }),
+                    h("p", { style: S.lead }, "Already run a program you love, or have an old one to reference? Paste it here \u2014 the engine reads it, learns from it, and can rebuild it as a live adaptive plan. You can also upload PDFs and spreadsheets any time from the Engine tab."),
+                    h("textarea", { value: progTxt, onChange: e => setProgTxt(e.target.value), rows: 6, placeholder: "Paste a program here \u2014 days, exercises, sets, reps, percentages. Any format. Or skip and import later.", style: { ...S.bigInput, resize: "vertical", fontFamily: "inherit", fontSize: 13.5, lineHeight: 1.5, marginTop: 4 } }),
+                    h("div", { style: { ...S.noteBox, marginTop: 12 } },
+                        h(Sparkles, { size: 13, color: ACC, style: { flexShrink: 0, marginTop: 0 } }),
+                        h("span", { style: { fontSize: 12, color: "#C7C7CC" } }, "Everything you bring is saved permanently in your Training Library \u2014 old blocks, new blocks, PDFs, screenshots.")),
+                    h("button", { onClick: function () { setProgTxt(""); setStep(step + 1); }, style: { marginTop: 14, width: "100%", padding: "11px", borderRadius: 12, border: `1px solid ${BORDER}`, background: "transparent", color: "#8E8E93", fontWeight: 700, fontSize: 13, cursor: "pointer" } }, "Skip \u2014 I'll import later")),
+                step === 9 && h(React.Fragment, null,
                     h(Title, { icon: Cpu, t: "How do you want to train?" }),
                     h("p", { style: S.lead }, "Pick the methodology that drives your programming \u2014 percent waves, RPE, RIR, or the approach of any school in the strength world. Mix two if you want a hybrid. You can change this any time, and your coach will follow it."),
                     h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginTop: 4 } }, STYLES.map(function(sx){
