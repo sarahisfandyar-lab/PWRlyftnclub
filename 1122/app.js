@@ -17799,6 +17799,7 @@ function applyStyleParams(primaryId, secondaryId){
     return out;
 }
 /* ---- custom programs: any uploaded program becomes a first-class training style ---- */
+var ADMIN_EMAIL = "sarahisfandyar@gmail.com";
 function daysOf(st){ const c = st && st.customDays; const base = (Array.isArray(c) && c.length) ? c : DAYS;
     const ov = (st && st.dayDow) || null;
     if (!ov) return base;
@@ -18095,6 +18096,47 @@ function logSetsOf(l) {
         return [{ kg: l.kg, reps: l.reps, rpe: l.rpe, pain: l.pain }]; // legacy single set
     return [];
 }
+/* ============================================================
+   ADAPTIVE ENGINE v1 — personal (per-athlete, works today)
+   Reads THIS athlete's real logged sets vs what was prescribed and
+   returns a gentle bias: consistently beating RPE targets -> push,
+   grinding/missing -> hold or back off. Bounded so it can never do
+   anything unsafe (hard clamp), and it only ever *informs* the plan.
+   ============================================================ */
+function adaptiveSignal(st, history, lift) {
+    // gather this lift's recent logged top singles + how they felt (RPE)
+    const rows = (history || []).filter(function (h) { return h && h.lifts && h.lifts[lift]; })
+        .slice(-6); // last ~6 exposures
+    if (rows.length < 3) return { bias: 0, conf: 0, n: rows.length, note: "building history" };
+    let beat = 0, grind = 0, hit = 0;
+    rows.forEach(function (h) {
+        const L = h.lifts[lift]; if (!L) return;
+        const rpe = parseFloat(L.rpe || L.topRpe || 0);
+        const target = parseFloat(L.targetRpe || 8);
+        if (!rpe) { hit++; return; }
+        if (rpe <= target - 1) beat++;          // finished with 1+ RIR to spare
+        else if (rpe >= target + 0.5) grind++;  // over the target, grinding
+        else hit++;
+    });
+    const n = rows.length;
+    // net readiness: more "beat" than "grind" -> positive bias
+    const raw = (beat - grind) / n;              // -1..1
+    const conf = Math.min(1, (n - 2) / 4);       // ramps 0->1 as history grows
+    // HARD SAFETY CLAMP: personal bias can never exceed +/-3% of the plan
+    const bias = Math.max(-0.03, Math.min(0.03, raw * 0.03 * conf));
+    return { bias: bias, conf: conf, n: n,
+        note: bias > 0.005 ? "you're beating targets \u2014 nudging up"
+            : bias < -0.005 ? "grinding lately \u2014 easing off"
+            : "on track" };
+}
+
+/* Pooled benchmark hook — filled by the SQL aggregation layer as the app grows.
+   Until there's real data it returns null and the engine simply ignores it. */
+function pooledSignal(st, lift) {
+    const p = st && st.pooledBenchmarks && st.pooledBenchmarks[lift];
+    if (!p || !p.n || p.n < 20) return null; // need real volume before trusting it
+    return p; // { n, medianWeeklyGainPct, typicalRpeAtPct, ... }
+}
 function repsNum(r) { return parseInt(String(r).split("-")[0]) || parseInt(r) || 0; }
 function setE1Best(l) {
     return logSetsOf(l).reduce((m, s) => {
@@ -18238,12 +18280,18 @@ function plannedKg(st, ex) {
     if (!ex.lift || !ex.pct)
         return null;
     const adj = 1 + liftAdjust(st, ex.lift).load; // manual override, cascades to every week
+    // adaptive personal bias (opt-in, bounded to +/-3%, only if enabled and enough history)
+    let bias = 0;
+    if (st.adaptive !== false && st._history) {
+        const sig = adaptiveSignal(st, st._history, ex.lift);
+        if (sig && sig.conf > 0) bias = sig.bias;
+    }
     let out;
     if (st.phase === "restart")
-        out = floor25((st.oneRM[ex.lift] || 0) * RESTART[st.restartWeek].pct * (ex.rf ?? ex.pct) * adj);
+        out = floor25((st.oneRM[ex.lift] || 0) * RESTART[st.restartWeek].pct * (ex.rf ?? ex.pct) * adj * (1 + bias));
     else {
         const w = ex.wave ? WAVE[st.week].intensity : 1;
-        out = floor25(trainingMax(st, ex.lift) * ex.pct * w * adj);
+        out = floor25(trainingMax(st, ex.lift) * ex.pct * w * adj * (1 + bias));
     }
     // hard safety cap: never prescribe a top-effort weight beyond the athlete's true best +6%
     if (ex.role === "TOP SET" || ex.pct >= 0.9) out = capPlanned(st, ex.lift, out);
@@ -19116,6 +19164,7 @@ function App() {
         writeHash(S2, H2, L2); // mirror into the URL so a refresh can't wipe it
     }, [st, history, logs]);
     const updateState = (patch, nlogs) => { if (nlogs) setLogs(nlogs); setSt(prev => { const n = { ...prev, ...patch }; persist(n, history, nlogs ?? logs); return n; }); };
+    if (st && !st._history) st._history = history; // adaptive engine reads recent logs
     const day = daysOf(st).find(d => d.id === activeDay) || daysOf(st)[0];
     const nextId = nextDayId(st);
     const targeted = useMemo(() => targetedSet(st), [st.weakpoints]);
@@ -19426,9 +19475,10 @@ function App() {
             tab === "session" && h(Session, { st: st, day: day, setActiveDay: setActiveDay, targeted: targeted, readiness: readiness, setReadiness: setReadiness, readinessScore: readinessScore, decision: decision, logs: logs, setLogSet: setLogSet, addSet: addSet, removeSet: removeSet, triggerRest: triggerRest, restSignal: restSignal, planned: (ex) => plannedKg(st, ex), setE1: setE1, completeSession: completeSession, openHelp: setHelpKey, nextId: nextId, updateState: updateState }),
             tab === "twin" && h(Twin, { st: st, history: history, metrics: metrics, updateState: updateState, showToast: showToast, openHelp: setHelpKey }),
             tab === "record" && h(BattleRecord, { st: st, history: history, openShare: setShareSpec }),
+            tab === "master" && cloud.user && cloud.user.email === ADMIN_EMAIL && h(MasterControl, { cloud: cloud, showToast: showToast }),
             tab === "engine" && h(Engine, { st: st, updateState: updateState, tmOf: (l) => trainingMax(st, l), advance: advance, resetAll: resetAll, exportData: exportData, importData: importData, showToast: showToast, cloud: cloud }),
             tab === "log" && h(Log, { history: history, readiness: metrics.readiness })),
-        mode !== "coach" && h(Dock, { tab: tab, setTab: setTab }),
+        mode !== "coach" && h(Dock, { tab: tab, setTab: setTab, isAdmin: cloud.user && cloud.user.email === ADMIN_EMAIL }),
         showBridge && h(BridgeModal, { st: st, tmOf: (l) => trainingMax(st, l), close: () => { setShowBridge(false); setTab("command"); } }),
         helpKey && h(HelpModal, { k: helpKey, close: () => setHelpKey(null) }),
         bwOpen && h(BwModal, { st: st, updateState: updateState, close: () => setBwOpen(false), showToast: showToast }),
@@ -19628,9 +19678,10 @@ function Header({ st, decision }) {
 }
 
 /* ---------------- BOTTOM DOCK NAV ---------------- */
-function Dock({ tab, setTab }) {
+function Dock({ tab, setTab, isAdmin }) {
     const tabs = [{ id: "command", label: "Home", icon: Activity }, { id: "session", label: "Train", icon: Dumbbell },
         { id: "twin", label: "Coach", icon: PawIcon }, { id: "record", label: "Progress", icon: Trophy }, { id: "engine", label: "Engine", icon: Cpu }, { id: "log", label: "History", icon: History }];
+    if (isAdmin) tabs.push({ id: "master", label: "Master", icon: Cpu });
     return (h("nav", { style: S.dock, className: "dockIn" },
         h("div", { style: S.dockInner },
             tabs.map(t => {
@@ -20021,7 +20072,14 @@ function Session({ st, day, setActiveDay, targeted, readiness, setReadiness, rea
                 inR ? `RESTART WEEK ${st.restartWeek}` : `WEEK ${st.week} · ${WAVE[st.week].phase}`),
             h("div", { style: { fontWeight: 800, fontSize: 22, marginTop: 4 } }, day.plain),
             h("div", { style: { fontSize: 12, color: "#98989F", marginTop: 4 } }, day.focus),
-            h(DayWeekdayPicker, { st: st, day: day, updateState: updateState })),
+            h(DayWeekdayPicker, { st: st, day: day, updateState: updateState }),
+            (function(){ if (st.adaptive === false) return null;
+                const sig = (st._history && day.ex) ? (function(){ const main = day.ex.find(function(e){ return e.lift; }); return main ? adaptiveSignal(st, st._history, main.lift) : null; })() : null;
+                if (!sig || sig.conf <= 0) return null;
+                const col = sig.bias > 0.005 ? POS : sig.bias < -0.005 ? "#ffb74d" : "#8E8E93";
+                return h("div", { style: { marginTop: 8, fontSize: 11, color: col, display: "flex", alignItems: "center", gap: 6 } },
+                    h("span", { style: { width: 6, height: 6, borderRadius: "50%", background: col } }),
+                    "ADAPTIVE: " + sig.note); })()),
         (function(){ const wc = waveContext(st); if (!wc) return null;
             const col = wc.dir === "up" ? POS : wc.dir === "down" ? "#ffb74d" : "#98989F";
             const bg = wc.dir === "up" ? "rgba(52,211,154,0.06)" : wc.dir === "down" ? "rgba(255,183,77,0.06)" : "rgba(255,255,255,0.03)";
@@ -20201,6 +20259,15 @@ function Engine({ st, updateState, tmOf, advance, resetAll, exportData, importDa
         setImpText("");
     } };
     return (h("div", null,
+        h(SectionLabel, { icon: Activity, text: "ADAPTIVE ENGINE", sub: "the plan learns from how your sets actually feel" }),
+        h("div", { style: { ...S.engineCard, marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between" } },
+            h("div", { style: { flex: 1, paddingRight: 12 } },
+                h("div", { style: { fontWeight: 800, fontSize: 13.5, color: "#fff" } }, st.adaptive === false ? "Off" : "On"),
+                h("div", { style: { fontSize: 11.5, color: "#98989F", marginTop: 3, lineHeight: 1.5 } }, "Reads your logged RPE vs targets and nudges loads \\u00b1 up to 3% \\u2014 never more. Beating targets pushes you; grinding eases off.")),
+            h("button", { onClick: function () { updateState({ adaptive: st.adaptive === false }); showToast(st.adaptive === false ? "Adaptive engine on." : "Adaptive engine off \\u2014 fixed plan."); },
+                style: { width: 52, height: 30, borderRadius: 15, border: "none", cursor: "pointer", position: "relative",
+                    background: st.adaptive === false ? "#3A3A3C" : POS, transition: "background .2s" } },
+                h("span", { style: { position: "absolute", top: 3, left: st.adaptive === false ? 3 : 25, width: 24, height: 24, borderRadius: "50%", background: "#fff", transition: "left .2s" } }))),
         h(SectionLabel, { icon: Activity, text: "ATHLETE PROFILE", sub: "your structure and history \u2014 optional, private to you and your coach" }),
         h(BiodataCard, { st: st, updateState: updateState, showToast: showToast }),
         h(SectionLabel, { icon: Activity, text: "ACCOUNT & SYNC", sub: "back up your training and sync across devices" }),
@@ -22134,6 +22201,15 @@ function useCloud(applyState) {
                         return { ...prev, customDays: norm, _coachProgramAt: prog.setAt, _coachProgramName: prog.name,
                             trainingLibrary: libAdd(prev, { name: prog.name || "Coach Program", kind: "coach", days: norm, summary: prog.note || "" }) };
                     }); } } catch (e2) {}
+            // pull pooled benchmarks (population intelligence) — ignored by engine until they have volume
+            try { const c2 = sb();
+                if (c2) { const bm = await c2.rpc("get_benchmarks");
+                    if (bm && bm.data && bm.data.length) applyState(function (prev) {
+                        const map = {}; bm.data.forEach(function (r) { map[r.lift] = {
+                            n: r.n_athletes || 0, medianTop: r.median_top, p25: r.p25_top, p75: r.p75_top,
+                            medianWeeklyGainPct: r.median_weekly_gain_pct }; });
+                        return { ...prev, pooledBenchmarks: map };
+                    }); } } catch (e3) {}
             setStatus("synced"); }
         catch (e) { setStatus("error"); }
     }, [applyState]);
@@ -22457,6 +22533,75 @@ function BiodataCard({ st, updateState, showToast }) {
             h("div", { style: { display: "flex", gap: 8, marginTop: 4 } },
                 h("button", { onClick: function () { setOpen(false); showToast("Biodata saved \u2014 syncs to your coach automatically."); }, style: { ...S.cta, flex: 2 } }, "DONE"),
                 h("button", { onClick: function () { updateState({ biodata: { skipped: true } }); setOpen(false); showToast("Skipped \u2014 you can add it any time."); }, style: { ...S.btn, flex: 1, color: "#8E8E93" } }, "Skip all"))) : null);
+}
+function MasterControl({ cloud, showToast }) {
+    const R = React;
+    const [stats, setStats] = R.useState(null);
+    const [err, setErr] = R.useState(null);
+    const load = R.useCallback(async function () {
+        const c = sb(); if (!c || !cloud.user) return;
+        try {
+            const out = {};
+            const prof = await c.from("profiles").select("id,is_coach", { count: "exact" });
+            out.users = (prof && prof.data) ? prof.data.length : 0;
+            out.coaches = (prof && prof.data) ? prof.data.filter(function(p){ return p.is_coach; }).length : 0;
+            const links = await c.from("coach_links").select("id,status");
+            out.links = (links && links.data) ? links.data.filter(function(l){ return l.status === "active"; }).length : 0;
+            const codes = await c.from("coach_codes").select("code,claimed_by,expires_at,created_at");
+            const cd = (codes && codes.data) || [];
+            out.codesTotal = cd.length;
+            out.codesClaimed = cd.filter(function(x){ return x.claimed_by; }).length;
+            out.codesLive = cd.filter(function(x){ return !x.claimed_by && x.expires_at && new Date(x.expires_at) > new Date(); }).length;
+            const sess = await c.from("sessions").select("id,athlete_id,performed_at").order("performed_at", { ascending: false }).limit(500);
+            const sd = (sess && sess.data) || [];
+            out.sessions = sd.length;
+            out.activeAthletes = new Set(sd.map(function(x){ return x.athlete_id; })).size;
+            const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0,10);
+            out.sessions7d = sd.filter(function(x){ return String(x.performed_at) >= since; }).length;
+            setStats(out);
+        } catch (e) { setErr(String((e && e.message) || e)); }
+    }, [cloud.user]);
+    R.useEffect(function () { load(); }, [load]);
+
+    const stat = function (label, value, hint, color) {
+        return h("div", { style: { ...S.engineCard, padding: 16, flex: "1 1 40%", minWidth: 140 } },
+            h("div", { style: { fontFamily: "ui-monospace, monospace", fontSize: 30, fontWeight: 800, color: color || "#fff", lineHeight: 1 } }, value),
+            h("div", { style: { ...S.mono, fontSize: 8.5, letterSpacing: 1.2, color: "#8E8E93", marginTop: 6 } }, label),
+            hint ? h("div", { style: { fontSize: 10.5, color: "#6E6E73", marginTop: 3 } }, hint) : null);
+    };
+
+    return h("div", { style: { ...S.main, paddingBottom: 40 }, className: "view" },
+        h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", margin: "6px 0 16px" } },
+            h("div", null,
+                h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 2, color: ACC } }, "MASTER CONTROL"),
+                h("div", { style: { fontWeight: 800, fontSize: 24, marginTop: 2 } }, "App metrics")),
+            h("button", { onClick: load, style: { ...S.btn, padding: "8px 14px" } }, "Refresh")),
+        err ? h("div", { style: { ...S.engineCard, borderColor: "#ff4d6d55", marginBottom: 12 } },
+            h("div", { style: { fontSize: 12, color: "#ffb3c0", lineHeight: 1.5 } }, "Couldn't load some metrics: " + err + " \u2014 run PWRLYFTN-COMPLETE-BACKEND.sql if tables are missing.")) : null,
+        !stats ? h("div", { style: { ...S.mono, color: "#6E6E73", textAlign: "center", padding: 30 } }, "LOADING METRICS\u2026")
+        : h("div", null,
+            h(SectionLabel, { icon: Activity, text: "PEOPLE", sub: "who's on the platform" }),
+            h("div", { style: { display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 16 } },
+                stat("TOTAL USERS", stats.users, null, "#fff"),
+                stat("ACTIVE ATHLETES", stats.activeAthletes, "logged \u2265 1 session", POS),
+                stat("COACHES", stats.coaches, null, ACC),
+                stat("ACTIVE LINKS", stats.links, "coach \u2194 athlete")),
+            h(SectionLabel, { icon: Flame, text: "TRAINING", sub: "activity across all users" }),
+            h("div", { style: { display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 16 } },
+                stat("SESSIONS (7D)", stats.sessions7d, "last 7 days", POS),
+                stat("SESSIONS TOTAL", stats.sessions, "recent 500 sampled"),
+                stat("AVG / ATHLETE", stats.activeAthletes ? Math.round(stats.sessions / stats.activeAthletes) : 0, "sessions each")),
+            h(SectionLabel, { icon: PawIcon, text: "INVITE CODES", sub: "onboarding funnel" }),
+            h("div", { style: { display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 16 } },
+                stat("CLAIMED", stats.codesClaimed, "became clients", POS),
+                stat("LIVE NOW", stats.codesLive, "unclaimed, valid", ACC),
+                stat("GENERATED", stats.codesTotal, "all time")),
+            h("div", { style: { ...S.engineCard, marginTop: 4 } },
+                h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 1.2, color: "#8E8E93", marginBottom: 8 } }, "BUILD"),
+                h("div", { style: { fontSize: 12.5, color: "#C7C7CC", lineHeight: 1.6 } },
+                    "Version ", h("b", { style: { color: "#fff" } }, "onyx-v19"), h("br"),
+                    "Signed in as ", h("b", { style: { color: ACC } }, cloud.user ? cloud.user.email : "\u2014"), h("br"),
+                    "This tab is visible only to you."))));
 }
 class CoachBoundary extends React.Component {
     constructor(p){ super(p); this.state = { err: null }; }
