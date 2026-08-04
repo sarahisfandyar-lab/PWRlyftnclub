@@ -22311,11 +22311,26 @@ function useCloud(applyState) {
         // Step 3 — no match -> reject, do NOT create a request
         if (!look || !look.data) throw new Error("Invalid coaching code.");
         const coach = look.data;
-        // Step 4 — insert the request with code populated (never null)
+        // Step 4 — insert ONLY columns that exist in coach_requests (no coach_id).
+        // Pull athlete profile bits for the coach's view; all optional.
+        let aEmail = (sess.user && sess.user.email) || null;
+        let aName = null, aGoal = null, aExp = null, aStrength = null;
+        try {
+            const p = _payload();
+            const prof = (p && p.profile) || {};
+            aName = prof.name || (profile && profile.display_name) || "Athlete";
+            aGoal = prof.goal || null;
+            aExp = prof.experience || null;
+            aStrength = (p && p.bestEver) || null;
+        } catch (e) {}
         const ins = await c.from("coach_requests").insert({
             athlete_id: me,
-            coach_id: coach.id,
-            code: coach.coach_code,
+            athlete_email: aEmail,
+            athlete_name: aName,
+            goal: aGoal,
+            experience: aExp,
+            strength: aStrength,
+            code: v,               // the coach code the athlete entered — never null
             status: "pending"
         });
         if (ins && ins.error) {
@@ -22504,21 +22519,54 @@ function MasterControl({ cloud, showToast }) {
     const load = R.useCallback(async function () {
         const c = sb(); if (!c || !cloud.user) return;
         setErr(null);
+        // Try the admin RPC first; if it's missing/stale in the API cache, fall back
+        // to direct table counts so the dashboard always works.
         try {
-            // Single admin RPC returns real platform-wide counts (bypasses per-row RLS safely, admin-only).
             const r = await c.rpc("admin_metrics");
-            if (r && r.error) throw r.error;
-            const m = (r && r.data) || {};
+            if (!(r && r.error) && r && r.data) {
+                const m = r.data;
+                setStats({
+                    users: m.users || 0, coaches: m.coaches || 0, links: m.active_links || 0,
+                    activeAthletes: m.active_athletes || 0, sessions: m.sessions_total || 0,
+                    sessions7d: m.sessions_7d || 0, requests: m.pending_requests || 0
+                });
+                return;
+            }
+        } catch (e) { /* fall through to direct queries */ }
+        // Fallback: count directly from tables (uses head:true count for efficiency).
+        try {
+            const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+            const q = function (tbl, filt) {
+                let sel = c.from(tbl).select("*", { count: "exact", head: true });
+                if (filt) sel = filt(sel);
+                return sel;
+            };
+            const [pAll, pCoach, links, sessAll, sess7, reqs] = await Promise.all([
+                q("profiles"),
+                q("profiles", function (s) { return s.eq("is_coach", true); }),
+                q("coach_links", function (s) { return s.eq("status", "active"); }),
+                q("sessions"),
+                q("sessions", function (s) { return s.gte("performed_at", since); }),
+                q("coach_requests", function (s) { return s.eq("status", "pending"); })
+            ]);
+            // distinct active athletes needs a light select
+            let activeAthletes = 0;
+            try {
+                const sd = await c.from("sessions").select("athlete_id").limit(1000);
+                if (sd && sd.data) activeAthletes = new Set(sd.data.map(function (x) { return x.athlete_id; })).size;
+            } catch (e) {}
             setStats({
-                users: m.users || 0,
-                coaches: m.coaches || 0,
-                links: m.active_links || 0,
-                activeAthletes: m.active_athletes || 0,
-                sessions: m.sessions_total || 0,
-                sessions7d: m.sessions_7d || 0,
-                requests: m.pending_requests || 0
+                users: pAll.count || 0,
+                coaches: pCoach.count || 0,
+                links: links.count || 0,
+                activeAthletes: activeAthletes,
+                sessions: sessAll.count || 0,
+                sessions7d: sess7.count || 0,
+                requests: reqs.count || 0
             });
-        } catch (e) { setErr(String((e && e.message) || e)); }
+        } catch (e2) {
+            setErr("Couldn't load metrics. Make sure the backend SQL has been run, then pull to refresh.");
+        }
     }, [cloud.user]);
     R.useEffect(function () { load(); }, [load]);
 
@@ -22681,7 +22729,7 @@ function CoachView({ cloud, showToast }) {
         (!cloud.user || !sb()) ? h("div", { style: { background: "#2a1518", border: "1px solid #ff4d6d55", color: "#ffb3c0", padding: "10px 14px", borderRadius: 10, margin: "12px 0", fontFamily: "monospace", fontSize: 11.5, lineHeight: 1.6 } },
             !sb() ? "Cloud connection failed to initialize \u2014 close the app fully and reopen." :
             "You're not signed in \u2014 go to Engine \u2192 Account and sign in, then come back.") : null,
-        h("div", { style: { ...S.engineCard, marginTop: 8, marginBottom: 12, borderColor: ACC + "44" }, className: "rise" },
+        h("div", { style: { ...S.engineCard, marginTop: 8, marginBottom: 12, borderColor: ACC + "44" }, className: "rise sheen" },
             h("div", { style: { ...S.mono, fontSize: 9, letterSpacing: 1.5, color: ACC, marginBottom: 10, fontWeight: 700 } }, "YOUR COACHING CODE"),
             h("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "18px", borderRadius: 12, border: `1px solid ${ACC}55`, background: `${ACC}12`, marginBottom: 10 } },
                 h("span", { style: { ...S.mono, fontSize: 30, fontWeight: 800, letterSpacing: 6, color: ACC } }, PERMANENT_CODE)),
@@ -22883,7 +22931,7 @@ function makeStyles() {
     dock: { position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 30, pointerEvents: "none" },
     dockInner: { pointerEvents: "auto", display: "flex", background: "rgba(8,8,10,0.78)", backdropFilter: "blur(28px) saturate(1.6)", WebkitBackdropFilter: "blur(28px) saturate(1.6)", borderTop: "0.5px solid rgba(255,255,255,0.12)", padding: "6px 8px calc(8px + env(safe-area-inset-bottom))" },
     dockBtn: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, padding: "6px 2px 4px", background: "transparent", border: "none", cursor: "pointer", position: "relative", zIndex: 1, transition: "color .18s ease", WebkitTapHighlightColor: "transparent" },
-    heroCard: { background: PANEL, border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 20, padding: 18, boxShadow: "0 1px 0 rgba(255,255,255,0.04) inset" },
+    heroCard: { background: "linear-gradient(180deg,#151518,#0F0F12)", border: "0.5px solid rgba(255,255,255,0.10)", borderRadius: 20, padding: 18, boxShadow: "0 1px 0 rgba(255,255,255,0.05) inset, 0 10px 34px rgba(0,0,0,0.5)" },
     heroGlow: { boxShadow: `0 18px 50px rgba(0,0,0,.45), 0 0 38px ${ACC}12` },
     heroSheen: { position: "absolute", inset: 0, pointerEvents: "none", background: `radial-gradient(120% 90% at 90% -20%, ${ACC}14 0%, transparent 55%)` },
     dayRail: { display: "flex", gap: 6, marginTop: 12, position: "relative" },
@@ -22896,7 +22944,7 @@ function makeStyles() {
     editBar: { display: "flex", alignItems: "center", gap: 8, padding: "4px 2px 8px" },
     editBtn: { width: 30, height: 26, display: "inline-flex", alignItems: "center", justifyContent: "center", background: "#101012", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#98989F", cursor: "pointer" },
     checkinCard: { background: `linear-gradient(180deg,${aBg2},#111114)`, border: `1px solid ${aBorder2}`, borderRadius: 12, padding: 16 },
-    coachCard: { background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, display: "flex", gap: 12, alignItems: "flex-start" },
+    coachCard: { background: "linear-gradient(180deg,#151518,#0F0F12)", border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16, display: "flex", gap: 12, alignItems: "flex-start" },
     noteBox: { display: "flex", gap: 8, padding: "11px 12px", background: aBg, border: `1px solid ${aBorder}`, borderRadius: 8 },
     intakeRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: `1px solid #1C1C1E`, flexWrap: "wrap" },
     snapRow: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 },
@@ -22908,7 +22956,7 @@ function makeStyles() {
     tmBar: { height: 4, background: "#1c1c22", borderRadius: 4, marginTop: 12, overflow: "hidden" },
     tmFill: { height: "100%", background: `linear-gradient(90deg, ${ACC}, ${ACC2})`, borderRadius: 4, transition: "width .6s ease" },
     chartWrap: { background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 12, padding: "16px 14px 12px" },
-    weekCard: { background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16 },
+    weekCard: { background: "linear-gradient(180deg,#151518,#0F0F12)", border: `1px solid ${BORDER}`, borderRadius: 12, padding: 16 },
     deltaChip: { fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontSize: 10, fontWeight: 700, letterSpacing: 0.5, border: "1px solid", borderRadius: 6, padding: "5px 9px" },
     volTrack: { flex: 1, height: 8, background: "#1c1c22", borderRadius: 4, overflow: "hidden" },
     volFill: { height: "100%", borderRadius: 4 },
@@ -22945,7 +22993,7 @@ function makeStyles() {
     setRemove: { width: 26, height: 30, flexShrink: 0, borderRadius: 6, border: "none", background: "transparent", color: "#6E6E73", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
     addSetBtn: { display: "inline-flex", alignItems: "center", gap: 6, padding: "7px 13px", background: aBg, border: `1px solid ${aBorder}`, borderRadius: 8, color: ACC, fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontSize: 10, letterSpacing: 1, cursor: "pointer", fontWeight: 700 },
     flagBar: { display: "flex", alignItems: "center", gap: 6, marginTop: 8, padding: "7px 9px", background: "#1a0d14", border: "1px solid #5a2238", borderRadius: 6 },
-    cta: { width: "100%", padding: "16px", background: ACC, border: "none", borderRadius: 14, color: "#1A1104", fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif", fontWeight: 600, fontSize: 16, letterSpacing: 0.2, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: "0 6px 20px rgba(224,178,107,0.28)", transition: "transform .12s ease, opacity .2s", overflow: "hidden", position: "relative" },
+    cta: { width: "100%", padding: "16px", background: "linear-gradient(155deg,#F0C987,#C9924F)", border: "none", borderRadius: 14, color: "#1A1104", fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif", fontWeight: 600, fontSize: 16, letterSpacing: 0.2, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: "0 8px 28px rgba(224,178,107,0.32), inset 0 1px 0 rgba(255,255,255,0.35)", transition: "transform .12s ease, opacity .2s, box-shadow .2s", overflow: "hidden", position: "relative" },
     ctaOff: { background: "#1c1c22", color: "#48484A", boxShadow: "none", cursor: "not-allowed" },
     backBtn: { padding: "15px 18px", background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 10, color: "#98989F", fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontWeight: 600, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 },
     ghostBtn: { background: "transparent", border: "none", color: ACC, fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontSize: 11, letterSpacing: 1, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, padding: 0 },
@@ -22957,7 +23005,7 @@ function makeStyles() {
     optCard: { padding: "13px 8px", background: "#101012", border: `1px solid ${BORDER}`, borderRadius: 10, color: "#EBEBF0", cursor: "pointer", textAlign: "center", transition: "all .15s" },
     optCardOn: { background: aBg, borderColor: ACC, boxShadow: `0 0 14px ${ACC}33`, color: "#fff" },
     engineGrid: { display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12 },
-    engineCard: { background: PANEL, border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 20, padding: 18, boxShadow: "0 1px 0 rgba(255,255,255,0.04) inset" },
+    engineCard: { background: "linear-gradient(180deg,#151518,#0F0F12)", border: "0.5px solid rgba(255,255,255,0.10)", borderRadius: 20, padding: 18, boxShadow: "0 1px 0 rgba(255,255,255,0.05) inset, 0 8px 30px rgba(0,0,0,0.45)" },
     cardTitle: { fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontSize: 11, letterSpacing: 2, color: "#EBEBF0", fontWeight: 700, marginBottom: 12, paddingBottom: 8, borderBottom: `1px solid #1C1C1E` },
     engineRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12 },
     engineInput: { background: "#101012", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "7px 9px", color: ACC, fontFamily: "ui-monospace, 'SF Mono', 'Menlo', monospace", fontSize: 14, width: 72, outline: "none", fontWeight: 700 },
